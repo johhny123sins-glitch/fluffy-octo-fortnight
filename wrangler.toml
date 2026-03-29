@@ -6,6 +6,11 @@ compatibility_date = "2026-01-01"
 [vars]
 ENABLE_TURNSTILE = "false"
 
+[observability]
+[observability.logs]
+enabled = false
+invocation_logs = true
+
 # Secrets (set with: wrangler secret put TURNSTILE_SECRET_KEY)
 # TURNSTILE_SECRET_KEY = "your_secret_key"
 
