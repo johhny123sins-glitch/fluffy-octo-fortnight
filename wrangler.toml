@@ -8,7 +8,7 @@ ENABLE_TURNSTILE = "false"
 
 [observability]
 [observability.logs]
-enabled = false
+enabled = true
 invocation_logs = true
 
 # Secrets (set with: wrangler secret put TURNSTILE_SECRET_KEY)
