@@ -1,483 +1,1070 @@
 /**
- * Cloudflare Workers — Hybrid Proxy
- *
- * Forwarded to https://proxy.wavembed.lol (with M3U8 URL rewriting):
- *   GET /m3u8-proxy
- *   GET /ts-proxy
- *   GET /mp4-proxy
- *   GET /subtitle
- *
- * Handled locally by the worker:
- *   GET /         — version info
- *   GET /health   — worker health check
- *   GET /fetch    — direct fetch proxy (streams response back to client)
+ * Cloudflare Workers Streaming Proxy - FIXED VERSION
+ * Comprehensive fixes for header handling and anti-bot bypassing
  */
 
-const UPSTREAM_HOST = "proxy3.wavembed.lol";
-const UPSTREAM_BASE = `https://${UPSTREAM_HOST}`;
+// Retry configuration for robust fetching - optimized for speed
+const RETRY_CONFIG = {
+  maxRetries: 2,
+  initialDelay: 25,
+  maxDelay: 300,
+  backoffMultiplier: 2
+};
 
-const VERSION = "1.0.1";
+const TIMEOUT_MS = 15000; // 15 second timeout for M3U8
+const SEGMENT_TIMEOUT_MS = 10000; // 10 second timeout for segments
 
-const FORWARDED_PATHS = new Set([
-  "/m3u8-proxy",
-  "/ts-proxy",
-  "/mp4-proxy",
-  "/subtitle",
-]);
+// Connection pool optimization with HTTP/2 and enhanced caching
+const FETCH_OPTIONS = {
+  cf: {
+    cacheTtl: 3600,
+    cacheEverything: true,
+    minify: { javascript: false, css: false, html: false },
+    mirage: false,
+    polish: 'off',
+    resolveOverride: null,
+    cacheKey: null
+  }
+};
 
-const BLOCKED_REQUEST_HEADERS = new Set([
-  "cf-connecting-ip",
-  "cf-ipcountry",
-  "cf-ray",
-  "cf-visitor",
-  "cf-worker",
-  "x-forwarded-proto",
-  "x-real-ip",
-  "host",
-]);
+// Request deduplication map
+const pendingRequests = new Map();
 
-const BLOCKED_RESPONSE_HEADERS = new Set([
-  "content-encoding",
-  "transfer-encoding",
-  "connection",
-  "keep-alive",
-  "upgrade",
-  "trailer",
-  "proxy-authenticate",
-  "proxy-authorization",
-]);
+// More realistic User-Agent (matches common browsers)
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// Content-types that indicate an M3U8 playlist response that needs rewriting
-const M3U8_CONTENT_TYPES = new Set([
-  "application/vnd.apple.mpegurl",
-  "application/x-mpegurl",
-  "audio/mpegurl",
-  "audio/x-mpegurl",
-  "text/plain", // some CDNs serve playlists as text/plain
-]);
+export default {
+  async fetch(request, env) {
+    request.startTime = Date.now();
+    
+    const url = new URL(request.url);
+    const path = url.pathname;
 
-// ---------------------------------------------------------------------------
-// CORS
-// ---------------------------------------------------------------------------
+    // CORS headers for all responses
+    const corsHeaders = {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': '*',
+      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Content-Type, Date, Server, X-Cache-Hit',
+      'Access-Control-Max-Age': '86400',
+      'Timing-Allow-Origin': '*'
+    };
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "*",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers":
-      "Content-Length, Content-Range, Content-Type, Date, Server, X-Cache-Hit, X-Upstream-Status",
-    "Access-Control-Max-Age": "86400",
-    "Timing-Allow-Origin": "*",
-  };
+    // Handle CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    try {
+      // Route requests
+      if (path === '/health') {
+        return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() }, corsHeaders);
+      }
+
+      if (path === '/m3u8-proxy') {
+        return await handleM3U8Proxy(request, env, corsHeaders);
+      }
+
+      if (path === '/ts-proxy') {
+        return await handleSegmentProxy(request, env, corsHeaders);
+      }
+
+      if (path === '/mp4-proxy' || path === '/mkv-proxy') {
+        return await handleMP4Proxy(request, env, corsHeaders);
+      }
+
+      if (path === '/subtitle') {
+        return await handleSubtitleProxy(request, env, corsHeaders);
+      }
+
+      if (path === '/fetch') {
+        return await handleFetch(request, env, corsHeaders);
+      }
+
+      // 404
+      return jsonResponse({
+        error: 'Not Found',
+        availableEndpoints: [
+          '/health',
+          '/m3u8-proxy?url=<url>&headers=<json_headers>&host=<hostname>',
+          '/ts-proxy?url=<url>&headers=<json_headers>&host=<hostname>',
+          '/mp4-proxy?url=<url>&headers=<json_headers>',
+          '/mkv-proxy?url=<url>&headers=<json_headers>',
+          '/fetch?url=<url>&headers=<json_headers>',
+          '/subtitle?url=<subtitle_url>&headers=<json_headers>'
+        ]
+      }, corsHeaders, 404);
+
+    } catch (error) {
+      console.error('Worker error:', error);
+      return jsonResponse({
+        error: 'Internal Server Error',
+        message: error.message
+      }, corsHeaders, 500);
+    }
+  }
+};
+
+/**
+ * Retry wrapper with exponential backoff, timeout protection, and request deduplication
+ */
+async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, timeoutMs = TIMEOUT_MS) {
+  const requestKey = `${url}:${JSON.stringify(options?.headers || {})}`;
+  if (pendingRequests.has(requestKey)) {
+    try {
+      return await pendingRequests.get(requestKey);
+    } catch (error) {
+      // If the pending request failed, continue to try again
+    }
+  }
+
+  let lastError;
+  let delay = RETRY_CONFIG.initialDelay;
+
+  const fetchPromise = (async () => {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+        const response = await fetch(url, {
+          ...FETCH_OPTIONS,
+          ...options,
+          signal: controller.signal,
+          cf: {
+            ...FETCH_OPTIONS.cf,
+            ...(options?.cf || {})
+          }
+        });
+
+        clearTimeout(timeoutId);
+
+        // Only retry on specific status codes (5xx and 429)
+        if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
+          pendingRequests.delete(requestKey);
+          return response;
+        }
+
+        lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+        console.warn(`⚠️ Attempt ${attempt + 1} failed: ${lastError.message}`);
+
+      } catch (error) {
+        lastError = error;
+        console.warn(`⚠️ Attempt ${attempt + 1} failed: ${error.message}`);
+        
+        if (attempt === retries || error.name === 'AbortError') {
+          break;
+        }
+      }
+
+      // Wait before retrying (exponential backoff)
+      if (attempt < retries) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(delay, RETRY_CONFIG.maxDelay)));
+        delay *= RETRY_CONFIG.backoffMultiplier;
+      }
+    }
+
+    pendingRequests.delete(requestKey);
+    throw lastError;
+  })();
+
+  pendingRequests.set(requestKey, fetchPromise);
+  return fetchPromise;
 }
 
-// ---------------------------------------------------------------------------
-// URL validation (SSRF protection)
-// ---------------------------------------------------------------------------
+/**
+ * Safe cache operations with error handling
+ */
+async function safeCacheGet(cache, cacheKey) {
+  try {
+    return await cache.match(cacheKey);
+  } catch (error) {
+    console.warn('Cache read error:', error.message);
+    return null;
+  }
+}
 
+async function safeCachePut(cache, cacheKey, response) {
+  try {
+    await cache.put(cacheKey, response);
+  } catch (error) {
+    console.warn('Cache write error:', error.message);
+  }
+}
+
+/**
+ * Validate URL before proxying to prevent SSRF attacks
+ */
 function validateUrl(urlString) {
   try {
     const url = new URL(urlString);
-    if (!["http:", "https:"].includes(url.protocol)) {
-      return { valid: false, error: "Only HTTP/HTTPS protocols allowed" };
+    
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      return { valid: false, error: 'Only HTTP/HTTPS protocols allowed' };
     }
-    const h = url.hostname.toLowerCase();
+
+    const hostname = url.hostname.toLowerCase();
     if (
-      h === "localhost" ||
-      h === "[::1]" ||
-      /^127\./.test(h) ||
-      /^10\./.test(h) ||
-      /^192\.168\./.test(h) ||
-      /^169\.254\./.test(h) ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+      hostname === 'localhost' ||
+      hostname.startsWith('127.') ||
+      hostname.startsWith('192.168.') ||
+      hostname.startsWith('10.') ||
+      hostname.startsWith('172.16.') ||
+      hostname.startsWith('169.254.') ||
+      hostname === '[::1]'
     ) {
-      return { valid: false, error: "Private/reserved IPs not allowed" };
+      return { valid: false, error: 'Private IPs not allowed' };
     }
+
     return { valid: true };
-  } catch {
-    return { valid: false, error: "Invalid URL format" };
+  } catch (error) {
+    return { valid: false, error: 'Invalid URL format' };
   }
 }
 
-// ---------------------------------------------------------------------------
-// Custom headers parser
-// Supports: ?headers={"X-Foo":"bar"} | base64 JSON | ?header_x_foo=bar
-// ---------------------------------------------------------------------------
-
-function parseCustomHeaders(searchParams) {
+/**
+ * FIXED: Parse custom headers from query parameters with proper error handling
+ */
+function parseCustomHeaders(url) {
   const customHeaders = {};
-  const headersParam = searchParams.get("headers");
+  
+  const headersParam = url.searchParams.get('headers');
   if (headersParam) {
     try {
-      let obj;
+      let headersObj;
       try {
-        obj = JSON.parse(headersParam);
+        headersObj = JSON.parse(headersParam);
       } catch {
-        obj = JSON.parse(atob(headersParam));
+        // Try base64 decode
+        const decoded = atob(headersParam);
+        headersObj = JSON.parse(decoded);
       }
-      Object.assign(customHeaders, obj);
-    } catch {
-      /* ignore malformed */
+      
+      // Properly merge headers (case-sensitive)
+      Object.assign(customHeaders, headersObj);
+      console.log('✓ Parsed custom headers:', Object.keys(headersObj));
+    } catch (error) {
+      console.warn('✗ Failed to parse headers:', error.message);
     }
   }
-  for (const [key, value] of searchParams.entries()) {
-    if (key.startsWith("header_")) {
-      customHeaders[key.slice(7).replace(/_/g, "-")] = value;
+
+  // Parse individual header_* parameters
+  for (const [key, value] of url.searchParams.entries()) {
+    if (key.startsWith('header_')) {
+      const headerName = key.replace('header_', '').replace(/_/g, '-');
+      customHeaders[headerName] = value;
     }
   }
+
   return customHeaders;
 }
 
-// ---------------------------------------------------------------------------
-// Anti-bot: rotating User-Agents
-// ---------------------------------------------------------------------------
-
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-];
-
-const ACCEPT_LANGUAGES = [
-  "en-US,en;q=0.9",
-  "en-US,en;q=0.9,es;q=0.8",
-  "en-GB,en;q=0.9",
-  "en-US,en;q=0.8",
-];
-
-const SEC_CH_UA_MAP = {
-  124: '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-  123: '"Chromium";v="123", "Google Chrome";v="123", "Not-A.Brand";v="99"',
-};
-
-function pickRandom(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
+/**
+ * FIXED: Build request headers with better bot detection avoidance
+ */
 function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
-  const ua =
-    customHeaders["User-Agent"] ||
-    customHeaders["user-agent"] ||
-    pickRandom(USER_AGENTS);
-  const chromeVerMatch = ua.match(/Chrome\/(\d+)/);
-  const chromeVer = chromeVerMatch ? chromeVerMatch[1] : null;
-  const secCHUA =
-    (chromeVer && SEC_CH_UA_MAP[chromeVer]) ||
-    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"';
-
   const headers = {
-    "User-Agent": ua,
-    Accept: "*/*",
-    "Accept-Language": pickRandom(ACCEPT_LANGUAGES),
-    "Accept-Encoding": "identity",
-    "Cache-Control": "no-cache",
-    Pragma: "no-cache",
-    Connection: "keep-alive",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
-    "sec-ch-ua": secCHUA,
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": ua.includes("Macintosh")
-      ? '"macOS"'
-      : ua.includes("Linux")
-        ? '"Linux"'
-        : '"Windows"',
+    'User-Agent': DEFAULT_USER_AGENT,
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
+    ...customHeaders
   };
 
-  for (const [key, value] of Object.entries(customHeaders)) {
-    if (key.toLowerCase() === "referer" && !includeReferer) continue;
-    headers[key] = value;
+  // If no-referer mode, remove any referer headers
+  if (!includeReferer) {
+    delete headers['Referer'];
+    delete headers['referer'];
   }
 
   return headers;
 }
 
-// ---------------------------------------------------------------------------
-// M3U8 URL rewriter
-// Replaces every occurrence of the upstream host with the worker's own host
-// so all proxied segment/playlist URLs route through the worker, not the
-// backend directly.
-// ---------------------------------------------------------------------------
-
-function rewriteM3U8Urls(text, workerBase) {
-  // Replace both http and https variants of the upstream host
-  const httpUpstream = `http://${UPSTREAM_HOST}`;
-  const httpsUpstream = `https://${UPSTREAM_HOST}`;
-
-  return text
-    .replaceAll(httpsUpstream, workerBase)
-    .replaceAll(httpUpstream, workerBase);
-}
-
-// Returns true if the response looks like an M3U8 playlist that needs rewriting
-function isM3U8Response(response) {
-  const ct = (response.headers.get("content-type") || "")
-    .split(";")[0]
-    .trim()
-    .toLowerCase();
-  if (M3U8_CONTENT_TYPES.has(ct)) return true;
-  // Also catch playlists served with wrong/missing content-type by peeking at the URL path
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-// /fetch handler — runs entirely in the worker
-// ---------------------------------------------------------------------------
-
-async function handleFetch(request) {
+/**
+ * Handle M3U8 playlist proxying with URL rewriting
+ */
+async function handleM3U8Proxy(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const targetUrl = url.searchParams.get("url");
-
+  const targetUrl = url.searchParams.get('url');
   if (!targetUrl) {
-    return new Response(JSON.stringify({ error: "Missing url parameter" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json", ...corsHeaders() },
+    return jsonResponse({ error: 'Missing url parameter' }, corsHeaders, 400);
+  }
+
+  const urlValidation = validateUrl(targetUrl);
+  if (!urlValidation.valid) {
+    return jsonResponse({ error: urlValidation.error }, corsHeaders, 400);
+  }
+
+  if (env.ENABLE_TURNSTILE === 'true') {
+    try {
+      const turnstileValid = await verifyTurnstile(request, env);
+      if (!turnstileValid) {
+        return jsonResponse({ error: 'Turnstile verification failed' }, corsHeaders, 403);
+      }
+    } catch (error) {
+      console.error('Turnstile verification error:', error);
+      return jsonResponse({ error: 'Verification service unavailable' }, corsHeaders, 503);
+    }
+  }
+
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+  const cachedResponse = await safeCacheGet(cache, cacheKey);
+  if (cachedResponse) {
+    return new Response(cachedResponse.body, {
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'X-Cache-Hit': 'true'
+      }
     });
   }
 
-  const { valid, error } = validateUrl(targetUrl);
-  if (!valid) {
-    return new Response(JSON.stringify({ error }), {
-      status: 400,
-      headers: { "Content-Type": "application/json", ...corsHeaders() },
+  // FIXED: Parse custom headers properly
+  const customHeaders = parseCustomHeaders(url);
+
+  // Support host parameter to override Host header
+  const hostOverride = url.searchParams.get('host');
+  if (hostOverride) {
+    customHeaders['Host'] = hostOverride;
+  }
+
+  try {
+    // FIXED: Use buildRequestHeaders for consistent header handling
+    const requestHeaders = buildRequestHeaders(customHeaders, true);
+
+    const m3u8Response = await fetchWithRetry(targetUrl, {
+      headers: requestHeaders
+    });
+
+    if (!m3u8Response.ok) {
+      return jsonResponse({
+        error: 'Failed to fetch M3U8',
+        status: m3u8Response.status,
+        statusText: m3u8Response.statusText
+      }, corsHeaders, m3u8Response.status);
+    }
+
+    const m3u8Content = await m3u8Response.text();
+    if (!m3u8Content.trim().startsWith('#EXTM3U')) {
+      return jsonResponse({
+        error: 'Invalid M3U8 content',
+        message: 'Response does not appear to be a valid M3U8 playlist'
+      }, corsHeaders, 422);
+    }
+
+    function robustParseUrl(reqUrl, baseUrl) {
+      try {
+        if (!reqUrl) return null;
+        if (/^https?:\/\//i.test(reqUrl)) return reqUrl;
+        return new URL(reqUrl, baseUrl).href;
+      } catch {
+        return null;
+      }
+    }
+
+    const workerUrl = new URL(request.url).origin;
+    const headersParam = url.searchParams.get('headers') ? `&headers=${encodeURIComponent(url.searchParams.get('headers'))}` : '';
+    const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
+    const baseUrl = targetUrl;
+
+    const isMaster = m3u8Content.includes('RESOLUTION=') || m3u8Content.includes('#EXT-X-STREAM-INF');
+    const lines = m3u8Content.split('\n');
+    const newLines = [];
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('#')) {
+        // Proxy #EXT-X-KEY
+        if (trimmed.startsWith('#EXT-X-KEY:')) {
+          const keyUrlMatch = line.match(/URI="([^"]+)"/);
+          if (keyUrlMatch) {
+            const keyUrl = robustParseUrl(keyUrlMatch[1], baseUrl);
+            if (keyUrl) {
+              const proxyKeyUrl = `${workerUrl}/ts-proxy?url=${encodeURIComponent(keyUrl)}${headersParam}${hostParam}`;
+              newLines.push(line.replace(keyUrlMatch[1], proxyKeyUrl));
+              continue;
+            }
+          }
+        }
+        // Proxy #EXT-X-MAP
+        if (trimmed.startsWith('#EXT-X-MAP:')) {
+          const mapUrlMatch = line.match(/URI="([^"]+)"/);
+          if (mapUrlMatch) {
+            const mapUrl = robustParseUrl(mapUrlMatch[1], baseUrl);
+            if (mapUrl) {
+              const proxyMapUrl = `${workerUrl}/ts-proxy?url=${encodeURIComponent(mapUrl)}${headersParam}${hostParam}`;
+              newLines.push(line.replace(mapUrlMatch[1], proxyMapUrl));
+              continue;
+            }
+          }
+        }
+        // Proxy #EXT-X-MEDIA
+        if (trimmed.startsWith('#EXT-X-MEDIA:')) {
+          const mediaUrlMatch = line.match(/URI="([^"]+)"/);
+          if (mediaUrlMatch) {
+            const mediaUrl = robustParseUrl(mediaUrlMatch[1], baseUrl);
+            if (mediaUrl) {
+              const proxyMediaUrl = `${workerUrl}/m3u8-proxy?url=${encodeURIComponent(mediaUrl)}${headersParam}${hostParam}`;
+              newLines.push(line.replace(mediaUrlMatch[1], proxyMediaUrl));
+              continue;
+            }
+          }
+        }
+        newLines.push(line);
+        continue;
+      }
+      // Master playlist: variant URLs
+      if (isMaster && trimmed && !trimmed.startsWith('#')) {
+        const variantUrl = robustParseUrl(trimmed, baseUrl);
+        if (variantUrl) {
+          newLines.push(`${workerUrl}/m3u8-proxy?url=${encodeURIComponent(variantUrl)}${headersParam}${hostParam}`);
+        } else {
+          newLines.push(line);
+        }
+        continue;
+      }
+      // Media playlist: segment URLs
+      if (!isMaster && trimmed && !trimmed.startsWith('#')) {
+        const segmentUrl = robustParseUrl(trimmed, baseUrl);
+        if (segmentUrl) {
+          newLines.push(`${workerUrl}/ts-proxy?url=${encodeURIComponent(segmentUrl)}${headersParam}${hostParam}`);
+        } else {
+          newLines.push(line);
+        }
+        continue;
+      }
+      newLines.push(line);
+    }
+
+    const responseHeaders = {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Allow-Methods': '*',
+      // Allow CF edge to cache live playlists for a few seconds so repeated
+      // player polls hit the edge and don't burn free Worker requests.
+      'Cache-Control': 'public, max-age=3, stale-while-revalidate=2'
+    };
+
+    const rewrittenContent = newLines.join('\n');
+    const finalResponse = new Response(rewrittenContent, { headers: responseHeaders });
+    if (m3u8Response.status !== 206) {
+      await safeCachePut(cache, cacheKey, finalResponse.clone());
+    }
+    return finalResponse;
+  } catch (error) {
+    return jsonResponse({
+      error: 'Proxy error',
+      message: error.message,
+      type: error.name
+    }, corsHeaders, 502);
+  }
+}
+
+/**
+ * FIXED: Handle TS/segment proxying with proper header handling
+ */
+async function handleSegmentProxy(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const targetUrl = url.searchParams.get('url');
+  
+  if (!targetUrl) {
+    return jsonResponse({ error: 'Missing url parameter' }, corsHeaders, 400);
+  }
+
+  const urlValidation = validateUrl(targetUrl);
+  if (!urlValidation.valid) {
+    return jsonResponse({ error: urlValidation.error }, corsHeaders, 400);
+  }
+
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+  const cachedResponse = await safeCacheGet(cache, cacheKey);
+
+  if (cachedResponse) {
+    let contentType = cachedResponse.headers.get('content-type');
+    if (!contentType) {
+      contentType = 'video/mp2t';
+    }
+    return new Response(cachedResponse.body, {
+      headers: {
+        'Content-Type': contentType,
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Methods': '*',
+        'Cache-Control': 'public, max-age=3600'
+      }
     });
   }
 
-  const customHeaders = parseCustomHeaders(url.searchParams);
+  // FIXED: Parse custom headers properly
+  const customHeaders = parseCustomHeaders(url);
+
+  // Support host parameter to override Host header
+  const hostOverride = url.searchParams.get('host');
+  if (hostOverride) {
+    customHeaders['Host'] = hostOverride;
+  }
+
+  // FIXED: Use buildRequestHeaders for consistent header handling
   const requestHeaders = buildRequestHeaders(customHeaders, true);
 
-  const rangeHeader = request.headers.get("Range");
-  if (rangeHeader) requestHeaders["Range"] = rangeHeader;
+  // Forward Range header if present
+  const rangeHeader = request.headers.get('Range');
+  if (rangeHeader) {
+    requestHeaders['Range'] = rangeHeader;
+  }
 
-  const hostOverride = (url.searchParams.get("host") || "").trim();
-  if (hostOverride) requestHeaders["Host"] = hostOverride;
-
-  let upstreamResponse;
   try {
-    upstreamResponse = await fetch(targetUrl, {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), SEGMENT_TIMEOUT_MS);
+
+    const segmentResponse = await fetch(targetUrl, {
+      headers: requestHeaders,
+      signal: controller.signal,
+      cf: {
+        cacheTtl: 3600,
+        cacheEverything: true
+      }
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!segmentResponse.ok) {
+      return jsonResponse({
+        error: 'Failed to fetch segment',
+        status: segmentResponse.status
+      }, corsHeaders, segmentResponse.status);
+    }
+
+    const contentType = segmentResponse.headers.get('content-type') || 'video/mp2t';
+
+    // Detect nested M3U8 by content-type first — avoids consuming any of the stream.
+    // Only peek body bytes when content-type is ambiguous.
+    const ctLower = contentType.toLowerCase();
+    let isM3U8Content = ctLower.includes('mpegurl') || ctLower.includes('m3u8');
+
+    if (!isM3U8Content) {
+      // Peek first 1 KB without disturbing the main stream using tee().
+      const [peekStream, mainStream] = segmentResponse.body.tee();
+      const peekReader = peekStream.getReader();
+      try {
+        const { value } = await peekReader.read();
+        if (value) {
+          const text = new TextDecoder().decode(value.slice(0, 1024));
+          isM3U8Content = text.trim().startsWith('#EXTM3U');
+        }
+      } catch (_) { /* ignore peek errors */ } finally {
+        peekReader.cancel().catch(() => {});
+      }
+
+      if (isM3U8Content) {
+        const content = await new Response(mainStream).text();
+        return rewriteNestedM3U8(content, segmentResponse.status, targetUrl, request, url, hostOverride, corsHeaders, cache, cacheKey);
+      }
+
+      // True binary segment: stream mainStream to client and tee into cache simultaneously.
+      return streamSegmentResponse(mainStream, segmentResponse, contentType, corsHeaders, cache, cacheKey);
+    }
+
+    // Content-type confirmed M3U8
+    const content = await segmentResponse.text();
+    if (content.trim().startsWith('#EXTM3U')) {
+      return rewriteNestedM3U8(content, segmentResponse.status, targetUrl, request, url, hostOverride, corsHeaders, cache, cacheKey);
+    }
+
+    // Fallback: content-type claimed M3U8 but body isn't — treat as binary
+    return streamSegmentResponse(segmentResponse.body, segmentResponse, contentType, corsHeaders, cache, cacheKey);
+
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      return jsonResponse({
+        error: 'Segment fetch timeout',
+        message: 'Origin server too slow'
+      }, corsHeaders, 504);
+    }
+    
+    return jsonResponse({
+      error: 'Proxy error',
+      message: error.message,
+      type: error.name
+    }, corsHeaders, 502);
+  }
+}
+
+/**
+ * FIXED: Handle MP4 proxying with proper headers
+ */
+async function handleMP4Proxy(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const targetUrl = url.searchParams.get('url');
+  
+  if (!targetUrl) {
+    return jsonResponse({ error: 'Missing url parameter' }, corsHeaders, 400);
+  }
+
+  const urlValidation = validateUrl(targetUrl);
+  if (!urlValidation.valid) {
+    return jsonResponse({ error: urlValidation.error }, corsHeaders, 400);
+  }
+
+  if (env.ENABLE_TURNSTILE === 'true') {
+    try {
+      const turnstileValid = await verifyTurnstile(request, env);
+      if (!turnstileValid) {
+        return jsonResponse({ error: 'Turnstile verification failed' }, corsHeaders, 403);
+      }
+    } catch (error) {
+      console.error('Turnstile verification error:', error);
+    }
+  }
+
+  const path = url.pathname;
+  console.log('🎬 MP4/MKV Request:', path);
+
+  // FIXED: Parse custom headers properly
+  const customHeaders = parseCustomHeaders(url);
+
+  // FIXED: Use buildRequestHeaders for consistent header handling
+  const requestHeaders = buildRequestHeaders(customHeaders, true);
+
+  // Forward Range header for seeking support
+  const rangeHeader = request.headers.get('Range');
+  if (rangeHeader) {
+    requestHeaders['Range'] = rangeHeader;
+  }
+
+  try {
+    const mp4Response = await fetchWithRetry(targetUrl, {
+      headers: requestHeaders,
+      cf: {
+        cacheTtl: 3600,
+        cacheEverything: true
+      }
+    }, RETRY_CONFIG.maxRetries, SEGMENT_TIMEOUT_MS);
+
+    if (!mp4Response.ok) {
+      console.error('❌ MP4 fetch failed:', mp4Response.status);
+      return jsonResponse({
+        error: 'Failed to fetch MP4',
+        status: mp4Response.status
+      }, corsHeaders, mp4Response.status);
+    }
+
+    // Always pass through the upstream content-type exactly as received —
+    // the browser already handles the raw URL correctly, so whatever the origin
+    // sends is the right value. Only synthesise a fallback when the origin sends
+    // nothing at all or the genuinely unhelpful application/octet-stream.
+    const upstreamContentType = mp4Response.headers.get('content-type');
+    let detectedContentType = upstreamContentType;
+    if (!detectedContentType || detectedContentType === 'application/octet-stream') {
+      const lowerUrl = targetUrl.toLowerCase().split('?')[0];
+      if (lowerUrl.endsWith('.mkv')) {
+        detectedContentType = 'video/x-matroska';
+      } else if (lowerUrl.endsWith('.webm')) {
+        detectedContentType = 'video/webm';
+      } else if (lowerUrl.endsWith('.mp4') || lowerUrl.endsWith('.m4v')) {
+        detectedContentType = 'video/mp4';
+      } else if (lowerUrl.endsWith('.mov')) {
+        detectedContentType = 'video/quicktime';
+      } else {
+        detectedContentType = path === '/mkv-proxy' ? 'video/x-matroska' : 'video/mp4';
+      }
+    }
+
+    const responseHeaders = new Headers({
+      ...corsHeaders,
+      'Content-Type': detectedContentType,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=3600'
+    });
+
+    if (mp4Response.headers.has('content-length')) {
+      responseHeaders.set('Content-Length', mp4Response.headers.get('content-length'));
+    }
+    if (mp4Response.headers.has('content-range')) {
+      responseHeaders.set('Content-Range', mp4Response.headers.get('content-range'));
+    }
+
+    const passthroughHeaders = [
+      'cache-control', 'last-modified', 'etag', 'expires', 'x-content-type-options', 'date', 'server'
+    ];
+    for (const [key, value] of mp4Response.headers.entries()) {
+      if (!responseHeaders.has(key) && passthroughHeaders.includes(key.toLowerCase())) {
+        responseHeaders.set(key, value);
+      }
+    }
+
+    return new Response(mp4Response.body, {
+      status: mp4Response.status,
+      statusText: mp4Response.statusText,
+      headers: responseHeaders
+    });
+
+  } catch (error) {
+    console.error('❌ MP4 proxy error:', error);
+    return jsonResponse({
+      error: 'Proxy error',
+      message: error.message,
+      type: error.name
+    }, corsHeaders, 502);
+  }
+}
+
+/**
+ * FIXED: Handle generic fetch with proper headers
+ */
+async function handleFetch(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const targetUrl = url.searchParams.get('url');
+  
+  if (!targetUrl) {
+    return jsonResponse({ error: 'Missing url parameter' }, corsHeaders, 400);
+  }
+
+  const urlValidation = validateUrl(targetUrl);
+  if (!urlValidation.valid) {
+    return jsonResponse({ error: urlValidation.error }, corsHeaders, 400);
+  }
+
+  if (env.ENABLE_TURNSTILE === 'true') {
+    try {
+      const turnstileValid = await verifyTurnstile(request, env);
+      if (!turnstileValid) {
+        return jsonResponse({ error: 'Turnstile verification failed' }, corsHeaders, 403);
+      }
+    } catch (error) {
+      console.error('Turnstile verification error:', error);
+    }
+  }
+
+  console.log('🌐 Fetch Request');
+
+  // FIXED: Parse custom headers properly
+  const customHeaders = parseCustomHeaders(url);
+
+  // FIXED: Use buildRequestHeaders for consistent header handling
+  const requestHeaders = buildRequestHeaders(customHeaders, true);
+
+  // Forward Range header if present
+  const rangeHeader = request.headers.get('Range');
+  if (rangeHeader) {
+    requestHeaders['Range'] = rangeHeader;
+  }
+
+  try {
+    const targetResponse = await fetchWithRetry(targetUrl, {
       method: request.method,
       headers: requestHeaders,
-      redirect: "follow",
+      cf: {
+        cacheTtl: 3600,
+        cacheEverything: true
+      }
     });
-  } catch (err) {
-    return new Response(
-      JSON.stringify({ error: "Bad Gateway", message: err.message }),
-      {
-        status: 502,
-        headers: { "Content-Type": "application/json", ...corsHeaders() },
-      },
-    );
-  }
 
-  if (!upstreamResponse.ok && upstreamResponse.status !== 206) {
-    return new Response(
-      JSON.stringify({
-        error: "Failed to fetch resource",
-        status: upstreamResponse.status,
-      }),
-      {
-        status: upstreamResponse.status,
-        headers: { "Content-Type": "application/json", ...corsHeaders() },
-      },
-    );
-  }
+    if (!targetResponse.ok) {
+      console.error('❌ Fetch failed:', targetResponse.status);
+      return jsonResponse({
+        error: 'Failed to fetch resource',
+        status: targetResponse.status
+      }, corsHeaders, targetResponse.status);
+    }
 
-  const responseHeaders = new Headers();
-  for (const [key, value] of upstreamResponse.headers.entries()) {
-    if (!BLOCKED_RESPONSE_HEADERS.has(key.toLowerCase())) {
+    const contentType = targetResponse.headers.get('content-type') || 'application/octet-stream';
+    console.log('✅ Fetched:', contentType);
+
+    const responseHeaders = new Headers({
+      ...corsHeaders,
+      'Content-Type': contentType,
+      'Accept-Ranges': 'bytes',
+      'X-Upstream-Status': String(targetResponse.status),
+      'Cache-Control': 'public, max-age=3600'
+    });
+
+    // Forward all headers from the proxied response except forbidden ones
+    for (const [key, value] of targetResponse.headers.entries()) {
+      const lowerKey = key.toLowerCase();
+      if (
+        lowerKey === 'content-type' ||
+        lowerKey === 'access-control-allow-origin' ||
+        lowerKey === 'access-control-allow-headers' ||
+        lowerKey === 'access-control-allow-methods' ||
+        lowerKey === 'x-upstream-status'
+      ) {
+        continue;
+      }
       responseHeaders.set(key, value);
     }
-  }
-  responseHeaders.set("Accept-Ranges", "bytes");
-  responseHeaders.set("X-Upstream-Status", String(upstreamResponse.status));
-  responseHeaders.set(
-    "Cache-Control",
-    "public, max-age=60, stale-while-revalidate=30",
-  );
-  for (const [key, value] of Object.entries(corsHeaders())) {
-    responseHeaders.set(key, value);
-  }
 
-  return new Response(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    headers: responseHeaders,
-  });
+    return new Response(targetResponse.body, {
+      status: targetResponse.status,
+      statusText: targetResponse.statusText,
+      headers: responseHeaders
+    });
+
+  } catch (error) {
+    console.error('❌ Fetch proxy error:', error);
+    return jsonResponse({
+      error: 'Proxy error',
+      message: error.message,
+      type: error.name
+    }, corsHeaders, 502);
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Forward handler — sends request to proxy.wavembed.lol
-// For /m3u8-proxy responses, rewrites all upstream host references in the
-// returned playlist so every URL routes through the worker instead.
-// ---------------------------------------------------------------------------
-
-async function handleForward(request, isM3U8Route, event) {
-  const cache = caches.default;
-  // include full URL (path + query)
-  const cacheKey = new Request(request.url, request);
-  let cached = await cache.match(cacheKey);
-  if (cached) {
-    const headers = new Headers(cached.headers);
-    headers.set("X-Cache-Hit", "true");
-
-    return new Response(cached.body, {
-      status: cached.status,
-      headers,
-    });
-  }
+/**
+ * FIXED: Handle subtitle proxy with proper headers
+ */
+async function handleSubtitleProxy(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const upstreamUrl = new URL(url.pathname + url.search, UPSTREAM_BASE);
-
-  const outboundHeaders = new Headers();
-  for (const [key, value] of request.headers.entries()) {
-    if (!BLOCKED_REQUEST_HEADERS.has(key.toLowerCase())) {
-      outboundHeaders.set(key, value);
-    }
+  const targetUrl = url.searchParams.get('url');
+  if (!targetUrl) {
+    return jsonResponse({ error: 'Missing url parameter' }, corsHeaders, 400);
   }
-  outboundHeaders.set("Host", UPSTREAM_HOST);
 
-  let upstreamResponse;
+  const urlValidation = validateUrl(targetUrl);
+  if (!urlValidation.valid) {
+    return jsonResponse({ error: urlValidation.error }, corsHeaders, 400);
+  }
+
   try {
-    upstreamResponse = await fetch(upstreamUrl.toString(), {
-      method: request.method,
-      headers: outboundHeaders,
-      body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-      redirect: "follow",
+    // FIXED: Parse custom headers and use them
+    const customHeaders = parseCustomHeaders(url);
+    const requestHeaders = buildRequestHeaders(customHeaders, true);
+
+    // Fetch subtitle with headers
+    const response = await fetchWithRetry(targetUrl, {
+      headers: requestHeaders,
+      cf: {
+        cacheTtl: 3600,
+        cacheEverything: true
+      }
+    }, 1, 15000);
+
+    if (!response.ok) {
+      return jsonResponse({ error: 'Failed to fetch subtitle', status: response.status }, corsHeaders, 502);
+    }
+
+    const buffer = await response.arrayBuffer();
+    
+    // Try to decode as UTF-8, fallback to ISO-8859-1 if it looks wrong
+    let text = '';
+    try {
+      text = new TextDecoder('utf-8').decode(buffer);
+      if ((text.match(/�/g) || []).length > 10) {
+        text = new TextDecoder('iso-8859-1').decode(buffer);
+      }
+    } catch (e) {
+      text = new TextDecoder('iso-8859-1').decode(buffer);
+    }
+
+    // Try to parse as SRT or VTT
+    let entries = parseSRTorVTT(text);
+    if (!entries || entries.length === 0) {
+      return jsonResponse({ error: 'Unsupported subtitle format or failed to parse.' }, corsHeaders, 415);
+    }
+
+    // Convert to SRT
+    const srt = entriesToSRT(entries);
+    const utf8Srt = new TextEncoder().encode(srt);
+    
+    return new Response(utf8Srt, {
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'public, max-age=3600'
+      }
     });
   } catch (err) {
-    return new Response(
-      JSON.stringify({ error: "Bad Gateway", message: err.message }),
-      {
-        status: 502,
-        headers: { "Content-Type": "application/json", ...corsHeaders() },
-      },
-    );
+    return jsonResponse({ error: 'Failed to fetch or convert subtitle', message: err.message }, corsHeaders, 500);
   }
-
-  const responseHeaders = new Headers();
-  for (const [key, value] of upstreamResponse.headers.entries()) {
-    if (!BLOCKED_RESPONSE_HEADERS.has(key.toLowerCase())) {
-      responseHeaders.set(key, value);
-    }
-  }
-  for (const [key, value] of Object.entries(corsHeaders())) {
-    responseHeaders.set(key, value);
-  }
-
-  // ---- Edge Cache TTL ----
-  let ttl = 300;
-
-  if (url.pathname === "/m3u8-proxy") ttl = 60;
-  if (url.pathname === "/ts-proxy") ttl = 3600;
-  if (url.pathname === "/mp4-proxy") ttl = 86400;
-  if (url.pathname === "/subtitle") ttl = 86400;
-
-  responseHeaders.set(
-    "Cache-Control",
-    `public, s-maxage=${ttl}, stale-while-revalidate=120`,
-  );
-
-  // ── M3U8 rewrite ──────────────────────────────────────────────────────────
-  // If this is a playlist route AND the response looks like a playlist,
-  // buffer the text and replace all upstream host references with the
-  // worker's own origin so segment/sub-playlist URLs route through us.
-  if (isM3U8Route && isM3U8Response(upstreamResponse)) {
-    const workerBase = `${url.protocol}//${url.host}`;
-    const text = await upstreamResponse.text();
-    const rewritten = rewriteM3U8Urls(text, workerBase);
-
-    // Remove content-length — byte count changed after rewrite
-    responseHeaders.delete("content-length");
-
-    const response = new Response(rewritten, {
-      status: upstreamResponse.status,
-      headers: responseHeaders,
-    });
-
-    if (upstreamResponse.ok || upstreamResponse.status === 206) {
-      event.waitUntil(cache.put(cacheKey, response.clone()));
-    }
-
-    return response;
-  }
-
-  // All other routes: stream body straight through
-  const response = new Response(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    headers: responseHeaders,
-  });
-
-  // Cache only successful responses — clone BEFORE returning so the stream
-  // isn't consumed. The per-route Cache-Control is already set above; do NOT
-  // overwrite it here.
-  if (upstreamResponse.ok || upstreamResponse.status === 206) {
-    event.waitUntil(cache.put(cacheKey, response.clone()));
-  }
-
-  return response;
 }
 
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
+/**
+ * Rewrite a nested M3U8 playlist found inside a ts-proxy response.
+ * Extracted into a helper so the main handler stays readable.
+ */
+function rewriteNestedM3U8(content, status, targetUrl, request, url, hostOverride, corsHeaders, cache, cacheKey) {
+  const baseUrl = new URL(targetUrl);
+  const workerUrl = new URL(request.url).origin;
+  const headersParam = url.searchParams.get('headers')
+    ? `&headers=${encodeURIComponent(url.searchParams.get('headers'))}`
+    : '';
+  const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
 
-export default {
-  async fetch(request, env, event) {
-    const url = new URL(request.url);
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 200, headers: corsHeaders() });
+  const lines = content.split('\n');
+  const rewrittenLines = lines.map(line => {
+    const trimmedLine = line.trim();
+    if (trimmedLine.startsWith('#')) {
+      const uriMatch = line.match(/URI="([^"]+)"/);
+      if (uriMatch) {
+        try {
+          const originalUri = uriMatch[1];
+          let resolvedUrl = (originalUri.startsWith('http://') || originalUri.startsWith('https://'))
+            ? originalUri
+            : new URL(originalUri, baseUrl.href).href;
+          const isPlaylist = resolvedUrl.includes('.m3u8') || resolvedUrl.includes('type=video') ||
+            resolvedUrl.includes('type=audio') || resolvedUrl.includes('type=subtitle') ||
+            resolvedUrl.includes('/playlist/');
+          const proxyUrl = isPlaylist
+            ? `${workerUrl}/m3u8-proxy?url=${encodeURIComponent(resolvedUrl)}${headersParam}${hostParam}`
+            : `${workerUrl}/ts-proxy?url=${encodeURIComponent(resolvedUrl)}${headersParam}${hostParam}`;
+          return line.replace(/URI="[^"]+"/, `URI="${proxyUrl}"`);
+        } catch (_) { return line; }
+      }
+      return line;
     }
+    if (!trimmedLine) return line;
+    try {
+      let resolvedUrl = (trimmedLine.startsWith('http://') || trimmedLine.startsWith('https://'))
+        ? trimmedLine
+        : new URL(trimmedLine, baseUrl.href).href;
+      const isPlaylist = resolvedUrl.includes('.m3u8') || resolvedUrl.includes('type=video') ||
+        resolvedUrl.includes('type=audio') || resolvedUrl.includes('type=subtitle') ||
+        resolvedUrl.includes('/playlist/');
+      return isPlaylist
+        ? `${workerUrl}/m3u8-proxy?url=${encodeURIComponent(resolvedUrl)}${headersParam}${hostParam}`
+        : `${workerUrl}/ts-proxy?url=${encodeURIComponent(resolvedUrl)}${headersParam}${hostParam}`;
+    } catch (_) { return line; }
+  });
 
-    if (url.pathname === "/") {
-      return new Response(
-        JSON.stringify({
-          name: "Shouldn't be here....",
-          version: VERSION,
-          //upstream: UPSTREAM_HOST,
-          //routes: ["/", "/health", "/fetch", "/m3u8-proxy", "/ts-proxy", "/mp4-proxy", "/subtitle"],
-        }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json", ...corsHeaders() },
-        },
-      );
+  const rewrittenContent = rewrittenLines.join('\n');
+  const finalResponse = new Response(rewrittenContent, {
+    status,
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Cache-Control': 'public, max-age=3, must-revalidate',
+      'X-Cache-Hit': 'false'
     }
+  });
+  if (status !== 206) {
+    safeCachePut(cache, cacheKey, finalResponse.clone()).catch(() => {});
+  }
+  return finalResponse;
+}
 
-    if (url.pathname === "/health") {
-      return new Response(
-        JSON.stringify({
-          status: "ok",
-          worker: true,
-          upstream: UPSTREAM_HOST,
-          timestamp: new Date().toISOString(),
-        }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json", ...corsHeaders() },
-        },
-      );
+/**
+ * Stream a binary TS segment to the client chunk-by-chunk as it arrives from
+ * the origin, while simultaneously writing a copy into the Workers cache.
+ *
+ * Why this matters on slow CDNs:
+ *   - Without streaming the Worker buffers the full segment before sending a
+ *     single byte to the player, adding the full download time as extra latency.
+ *   - With streaming the player receives and decodes each chunk the moment it
+ *     lands at the edge, so playback can start before the segment is complete.
+ *   - The cache tee means the *next* request for the same segment is served
+ *     instantly from cache without touching the origin at all.
+ */
+function streamSegmentResponse(bodyStream, originResponse, contentType, corsHeaders, cache, cacheKey) {
+  const status = originResponse.status;
+
+  // Build response headers once
+  const headers = new Headers({
+    'Content-Type': contentType,
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': '*',
+    'Access-Control-Allow-Methods': '*',
+    'Cache-Control': 'public, max-age=3600',
+    'Accept-Ranges': 'bytes',
+    'X-Content-Type-Options': 'nosniff',
+    'Timing-Allow-Origin': '*'
+  });
+  if (originResponse.headers.get('content-length')) {
+    headers.set('Content-Length', originResponse.headers.get('content-length'));
+  }
+  if (originResponse.headers.get('content-range')) {
+    headers.set('Content-Range', originResponse.headers.get('content-range'));
+  }
+
+  // Only cache full (non-partial) responses
+  if (status !== 206) {
+    // tee() splits the readable stream into two independent streams:
+    //   clientStream  → sent to the player immediately, chunk by chunk
+    //   cacheStream   → consumed by cache.put() in the background
+    // Neither side blocks the other, so the player gets bytes as they arrive.
+    const [clientStream, cacheStream] = bodyStream.tee();
+
+    // Fire-and-forget cache write — errors are suppressed so they never
+    // affect the player response.
+    safeCachePut(cache, cacheKey, new Response(cacheStream, { status, headers: new Headers(headers) }))
+      .catch(() => {});
+
+    return new Response(clientStream, { status, headers });
+  }
+
+  // Partial (206) responses: just stream through, don't cache
+  return new Response(bodyStream, { status, headers });
+}
+
+
+// Minimal SRT/VTT parser for Workers
+function parseSRTorVTT(text) {
+  text = text.replace(/^\uFEFF/, '').replace(/\r\n|\r/g, '\n');
+  text = text.replace(/^WEBVTT.*?\n+/, '');
+  const blocks = text.split(/\n{2,}/);
+  const entries = [];
+  for (const block of blocks) {
+    const lines = block.split('\n').filter(Boolean);
+    if (lines.length < 2) continue;
+    let idx = 0;
+    if (/^\d+$/.test(lines[0])) idx = 1;
+    const timeMatch = lines[idx].match(/(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})/);
+    if (!timeMatch) continue;
+    const start = timeMatch[1].replace(',', '.');
+    const end = timeMatch[2].replace(',', '.');
+    const textLines = lines.slice(idx + 1).join('\n');
+    entries.push({ start, end, text: textLines });
+  }
+  return entries;
+}
+
+// Convert parsed entries to SRT format
+function entriesToSRT(entries) {
+  return entries.map((e, i) => `${i + 1}\n${e.start.replace('.', ',')} --> ${e.end.replace('.', ',')}\n${e.text}\n`).join('\n');
+}
+
+/**
+ * Verify Cloudflare Turnstile token
+ */
+async function verifyTurnstile(request, env) {
+  const url = new URL(request.url);
+  const token = request.headers.get('cf-turnstile-token') || 
+                url.searchParams.get('token');
+
+  if (!token) {
+    return false;
+  }
+
+  const formData = new FormData();
+  formData.append('secret', env.TURNSTILE_SECRET_KEY);
+  formData.append('response', token);
+  formData.append('remoteip', request.headers.get('CF-Connecting-IP'));
+
+  const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    body: formData
+  });
+
+  const outcome = await result.json();
+  return outcome.success;
+}
+
+/**
+ * Helper to create JSON responses
+ */
+function jsonResponse(data, corsHeaders, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/json; charset=utf-8'
     }
-
-    if (url.pathname === "/fetch") {
-      return handleFetch(request);
-    }
-
-    if (FORWARDED_PATHS.has(url.pathname)) {
-      const isM3U8Route = url.pathname === "/m3u8-proxy";
-      return handleForward(request, isM3U8Route, event);
-    }
-
-    return new Response(
-      JSON.stringify({ error: "Not Found", path: url.pathname }),
-      {
-        status: 404,
-        headers: { "Content-Type": "application/json", ...corsHeaders() },
-      },
-    );
-  },
-};
+  });
+}
