@@ -33,12 +33,70 @@ const pendingRequests = new Map();
 // More realistic User-Agent (matches common browsers)
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// Tracks isolate-local request stats for /stats. Resets whenever Cloudflare
+// recycles this isolate, so this is per-isolate uptime, not global server uptime.
+const WORKER_START_TIME = Date.now();
+const KNOWN_ENDPOINTS = ['/health', '/m3u8-proxy', '/ts-proxy', '/mp4-proxy', '/mkv-proxy', '/subtitle', '/fetch', '/stats'];
+const stats = {
+  totalRequests: 0,
+  totalErrors: 0,
+  activeRequests: 0,
+  clientConnections: 0,
+  byEndpoint: {}
+};
+
+function getEndpointStats(path) {
+  const key = KNOWN_ENDPOINTS.includes(path) ? path : 'other';
+  if (!stats.byEndpoint[key]) {
+    stats.byEndpoint[key] = { inFlight: 0, total: 0, errors: 0 };
+  }
+  return stats.byEndpoint[key];
+}
+
+function buildStatsPayload() {
+  return {
+    ok: true,
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.floor((Date.now() - WORKER_START_TIME) / 1000),
+    activeRequests: stats.activeRequests,
+    clientConnections: stats.clientConnections,
+    totalRequests: stats.totalRequests,
+    totalErrors: stats.totalErrors,
+    byEndpoint: stats.byEndpoint,
+    // Not observable from the Workers runtime: no process.memoryUsage() and
+    // no Node http.Agent socket pools (Cloudflare manages upstream connections internally).
+    upstreamPools: null,
+    memory: null
+  };
+}
+
+// Wraps a response body so clientConnections stays incremented for as long as
+// the body is still streaming to the client, since proxied video/segment
+// bodies keep flowing well after the handler itself has returned.
+function trackClientConnection(response) {
+  stats.clientConnections++;
+  if (!response.body) {
+    stats.clientConnections--;
+    return response;
+  }
+  const { readable, writable } = new TransformStream();
+  response.body.pipeTo(writable).catch(() => {}).finally(() => {
+    stats.clientConnections--;
+  });
+  return new Response(readable, response);
+}
+
 export default {
   async fetch(request, env) {
     request.startTime = Date.now();
     
     const url = new URL(request.url);
     const path = url.pathname;
+    const endpointStats = getEndpointStats(path);
+    endpointStats.total++;
+    endpointStats.inFlight++;
+    stats.totalRequests++;
+    stats.activeRequests++;
 
     // CORS headers for all responses
     const corsHeaders = {
@@ -53,56 +111,59 @@ export default {
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+      endpointStats.inFlight--;
+      stats.activeRequests--;
+      return trackClientConnection(new Response(null, { headers: corsHeaders }));
     }
 
+    let response;
     try {
       // Route requests
-      if (path === '/health') {
-        return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() }, corsHeaders);
+      if (path === '/stats') {
+        response = jsonResponse(buildStatsPayload(), corsHeaders);
+      } else if (path === '/health') {
+        response = jsonResponse({ status: 'ok', timestamp: new Date().toISOString() }, corsHeaders);
+      } else if (path === '/m3u8-proxy') {
+        response = await handleM3U8Proxy(request, env, corsHeaders);
+      } else if (path === '/ts-proxy') {
+        response = await handleSegmentProxy(request, env, corsHeaders);
+      } else if (path === '/mp4-proxy' || path === '/mkv-proxy') {
+        response = await handleMP4Proxy(request, env, corsHeaders);
+      } else if (path === '/subtitle') {
+        response = await handleSubtitleProxy(request, env, corsHeaders);
+      } else if (path === '/fetch') {
+        response = await handleFetch(request, env, corsHeaders);
+      } else {
+        // 404
+        response = jsonResponse({
+          error: 'Not Found',
+          availableEndpoints: [
+            '/health',
+            '/m3u8-proxy?url=<url>&headers=<json_headers>&host=<hostname>',
+            '/ts-proxy?url=<url>&headers=<json_headers>&host=<hostname>',
+            '/mp4-proxy?url=<url>&headers=<json_headers>',
+            '/mkv-proxy?url=<url>&headers=<json_headers>',
+            '/fetch?url=<url>&headers=<json_headers>',
+            '/subtitle?url=<subtitle_url>&headers=<json_headers>'
+          ]
+        }, corsHeaders, 404);
       }
-
-      if (path === '/m3u8-proxy') {
-        return await handleM3U8Proxy(request, env, corsHeaders);
-      }
-
-      if (path === '/ts-proxy') {
-        return await handleSegmentProxy(request, env, corsHeaders);
-      }
-
-      if (path === '/mp4-proxy' || path === '/mkv-proxy') {
-        return await handleMP4Proxy(request, env, corsHeaders);
-      }
-
-      if (path === '/subtitle') {
-        return await handleSubtitleProxy(request, env, corsHeaders);
-      }
-
-      if (path === '/fetch') {
-        return await handleFetch(request, env, corsHeaders);
-      }
-
-      // 404
-      return jsonResponse({
-        error: 'Not Found',
-        availableEndpoints: [
-          '/health',
-          '/m3u8-proxy?url=<url>&headers=<json_headers>&host=<hostname>',
-          '/ts-proxy?url=<url>&headers=<json_headers>&host=<hostname>',
-          '/mp4-proxy?url=<url>&headers=<json_headers>',
-          '/mkv-proxy?url=<url>&headers=<json_headers>',
-          '/fetch?url=<url>&headers=<json_headers>',
-          '/subtitle?url=<subtitle_url>&headers=<json_headers>'
-        ]
-      }, corsHeaders, 404);
-
     } catch (error) {
       console.error('Worker error:', error);
-      return jsonResponse({
+      response = jsonResponse({
         error: 'Internal Server Error',
         message: error.message
       }, corsHeaders, 500);
     }
+
+    endpointStats.inFlight--;
+    stats.activeRequests--;
+    if (response.status >= 400) {
+      endpointStats.errors++;
+      stats.totalErrors++;
+    }
+
+    return trackClientConnection(response);
   }
 };
 
